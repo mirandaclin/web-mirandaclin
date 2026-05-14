@@ -70,7 +70,9 @@ jobs:
           FILE_NAME="${IMAGE_NAME}.tar"
           TAG_NAME="${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_REPOSITORY }}:${{ steps.branch.outputs.branch }}"
 
-          docker build -t "$TAG_NAME" .
+          docker build \
+            --build-arg SERVER_DNS=${{ secrets.SERVER_DNS }} \
+            -t "$TAG_NAME" .
           docker save "$TAG_NAME" > "$FILE_NAME"
 
           echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
