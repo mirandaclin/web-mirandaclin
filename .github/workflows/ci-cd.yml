@@ -71,7 +71,8 @@ jobs:
           TAG_NAME="${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_REPOSITORY }}:${{ steps.branch.outputs.branch }}"
 
           docker build \
-            --build-arg SERVER_DNS=${{ secrets.SERVER_DNS }} \
+            --build-arg SERVER_DNS=${{ secrets.SERVER_PUBLIC_DNS }} \
+            --build-arg APP_PORT=${{ secrets.APP_LOCAL_PORT }} \
             -t "$TAG_NAME" .
           docker save "$TAG_NAME" > "$FILE_NAME"
 
@@ -82,8 +83,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ secrets.AWS_USER_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_USER_KEY_SECRET }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       # FIX 6: normaliza "None" (retorno do AWS CLI quando vazio) para string vazia
@@ -185,17 +186,17 @@ jobs:
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ steps.ip.outputs.ip }}
-          username: ${{ secrets.APP_USER }}
-          key: ${{ secrets.APP_KEY }}
+          username: ${{ secrets.AWS_SSH_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
           source: ${{ steps.docker.outputs.file_name }}
-          target: "/home/${{ secrets.APP_USER }}/app/"
+          target: "/home/${{ secrets.AWS_SSH_USER }}/app/"
 
       - name: Configure and start service
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ steps.ip.outputs.ip }}
-          username: ${{ secrets.APP_USER }}
-          key: ${{ secrets.APP_KEY }}
+          username: ${{ secrets.AWS_SSH_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
           script: |
             # Docker: instala se ausente (instâncias existentes que não passaram pelo userdata)
             if ! command -v docker &>/dev/null; then
@@ -210,7 +211,7 @@ jobs:
               sudo usermod -aG docker "$USER" || true
             fi
 
-            APP_DIR="/home/${{ secrets.APP_USER }}/app"
+            APP_DIR="/home/${{ secrets.AWS_SSH_USER }}/app"
             DOCKER_FILE="$APP_DIR/${{ steps.docker.outputs.file_name }}"
 
             docker load -i "$DOCKER_FILE"
@@ -219,8 +220,8 @@ jobs:
             docker run -d \
               --name "${{ steps.docker.outputs.image_name }}" \
               --restart unless-stopped \
-              -p ${{ secrets.APP_PORT }}:${{ secrets.APP_PORT }} \
-              -e APP_PORT=${{ secrets.APP_PORT }} \
+              -p ${{ secrets.APP_LOCAL_PORT }}:${{ secrets.APP_LOCAL_PORT }} \
+              -e APP_PORT=${{ secrets.APP_LOCAL_PORT }} \
               "${{ steps.docker.outputs.tag_name }}"
             docker image prune -f
 
@@ -237,7 +238,7 @@ jobs:
               echo "    listen 80;"
               echo "    server_name ${{ steps.ip.outputs.dns }};"
               echo "    location / {"
-              echo "        proxy_pass http://localhost:${{ secrets.APP_PORT }};"
+              echo "        proxy_pass http://localhost:${{ secrets.APP_LOCAL_PORT }};"
               echo "        proxy_http_version 1.1;"
               echo "        proxy_set_header Host \$host;"
               echo "        proxy_set_header X-Real-IP \$remote_addr;"
