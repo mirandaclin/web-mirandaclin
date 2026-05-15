@@ -182,6 +182,21 @@ jobs:
           echo "dns=$DNS" >> $GITHUB_OUTPUT
           echo "ip=$IP" >> $GITHUB_OUTPUT
 
+      - name: Sync HOSTNAME to org secret
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh secret set WEB_PUBLIC_DNS \
+            --visibility all \
+            --org ${{ secrets.ORGANIZATION }} \
+            --body "${{ steps.ip.outputs.dns }}"
+
+          gh secret set WEB_PUBLIC_DNS \
+            --env ${{ (github.ref_name == 'main' || github.ref_name == 'master') && 'prod' || 'stg' }} \
+            --visibility all \
+            --org ${{ secrets.ORGANIZATION }} \
+            --body "${{ steps.ip.outputs.dns }}"
+
       - name: Copy image to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
