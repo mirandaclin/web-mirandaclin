@@ -191,6 +191,10 @@ jobs:
             --org ${{ secrets.ORGANIZATION }} \
             --body "${{ steps.ip.outputs.dns }}"
 
+      - name: Sync HOSTNAME to env in org secret
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
           gh secret set WEB_PUBLIC_DNS \
             --env ${{ (github.ref_name == 'main' || github.ref_name == 'master') && 'prod' || 'stg' }} \
             --visibility all \
