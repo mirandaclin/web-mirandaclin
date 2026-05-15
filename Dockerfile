@@ -29,4 +29,4 @@ RUN npm install -g serve
 
 EXPOSE $APP_PORT
 
-CMD ["serve", "-s", "dist", "-l", $APP_PORT]
+CMD ["serve", "-s", "dist", "-l", "$APP_PORT", "--no-clipboard"]
