@@ -185,11 +185,27 @@ jobs:
       - name: Sync HOSTNAME to org secret
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ORGANIZATION: ${{ secrets.ORGANIZATION }}
+          CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
+          DNS: http://${{ steps.ip.outputs.dns }}
         run: |
           gh secret set WEB_PUBLIC_DNS \
             --visibility all \
-            --org ${{ secrets.ORGANIZATION }} \
-            --body "http://${{ steps.ip.outputs.dns }}"
+            --org $ORGANIZATION \
+            --body "$DNS"
+
+          if [[ ! "$CORS_ALLOWED_ORIGINS" =~ "$DNS" ]]; then
+      
+            NEW_CORS="$DNS,$CORS_ALLOWED_ORIGINS"
+            if [ -z "$CORS_ALLOWED_ORIGINS" ]; then
+              NEW_CORS="$DNS"
+            fi
+
+            gh secret set CORS_ALLOWED_ORIGINS \
+              --visibility all \
+              --org $ORGANIZATION \
+              --body "$NEW_CORS"
+          fi
 
       - name: Copy image to EC2
         uses: appleboy/scp-action@v0.1.7
