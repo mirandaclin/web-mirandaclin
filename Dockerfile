@@ -1,4 +1,7 @@
-FROM node:22-alpine
+# ── Build stage ──────────────────────────────────────────────────────────────
+FROM node:22-alpine AS builder
+
+ARG SERVER_DNS
 
 WORKDIR /app
 
@@ -6,7 +9,24 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+RUN npx ng build --configuration=production
 
-EXPOSE 4200
+RUN apk add --no-cache gettext && \
+  envsubst '${SERVER_DNS}' \
+  < /app/dist/frontodonto/browser/assets/env.js.template \
+  > /app/dist/frontodonto/browser/assets/env.js
 
-CMD ["npx", "ng", "serve", "--host", "0.0.0.0", "--port", "4200", "--poll", "2000"]
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM node:22-alpine
+
+ARG APP_PORT
+
+WORKDIR /app
+
+COPY --from=builder /app/dist/frontodonto/browser ./dist
+
+RUN npm install -g serve
+
+EXPOSE $APP_PORT
+
+CMD serve -s /app/dist -l ${APP_PORT:-4200} --no-clipboard

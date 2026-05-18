@@ -24,6 +24,10 @@ export const routes: Routes = [
     path: 'accept-invite',
     loadComponent: () => import('./features/auth/accept-invite/accept-invite').then(m => m.AcceptInviteComponent),
   },
+  {
+    path: 'convite/aceitar',
+    loadComponent: () => import('./features/auth/convite-aceitar/convite-aceitar').then(m => m.ConviteAceitarComponent),
+  },
 
   {
     path: '',

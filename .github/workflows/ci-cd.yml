@@ -1,0 +1,284 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 – Build & Test  (runs on every push / PR)
+  # ─────────────────────────────────────────────────────────────────────────────
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build -- --configuration=production
+
+      - name: Run tests
+        run: CI=true npm test
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2 – Deploy to EC2  (main branch only)
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    needs: ci
+    environment:
+      name: ${{ (github.ref_name == 'main' || github.ref_name == 'master') && 'prod' || 'stg' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # FIX 1: checkout obrigatório — sem ele docker build e git falham
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # FIX 2: github.ref_name funciona em detached HEAD; git branch --show-current retorna vazio
+      - name: Set branch name
+        id: branch
+        run: |
+          BRANCH=$(echo "${{ github.ref_name }}" | tr '/' '-')
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # FIX 3: removido docker/build-push-action (redundante e não tageia a imagem)
+      # FIX 4: DOCKER_FILE_NAME usa '-' em vez de '/' — path válido para docker save
+      # FIX 5: image_name usa '-' em vez de '/' — nome válido para container Docker
+      - name: Build and save Docker image
+        id: docker
+        run: |
+          IMAGE_NAME="${{ secrets.DOCKER_USERNAME }}-${{ secrets.DOCKER_REPOSITORY }}"
+          FILE_NAME="${IMAGE_NAME}.tar"
+          TAG_NAME="${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_REPOSITORY }}:${{ steps.branch.outputs.branch }}"
+
+          docker build \
+            --build-arg SERVER_DNS=${{ secrets.SERVER_PUBLIC_DNS }} \
+            --build-arg APP_PORT=${{ secrets.APP_LOCAL_PORT }} \
+            -t "$TAG_NAME" .
+          docker save "$TAG_NAME" > "$FILE_NAME"
+
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_USER_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_USER_KEY_SECRET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # FIX 6: normaliza "None" (retorno do AWS CLI quando vazio) para string vazia
+      - name: Check existing instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Branch,Values=${{ steps.branch.outputs.branch }}" \
+                      "Name=tag:Service,Values=${{ secrets.APP_NAME }}" \
+                      "Name=instance-state-name,Values=running,pending,stopped" \
+            --query "Reservations[*].Instances[*].InstanceId" --output text)
+
+          if [[ "$INSTANCE_ID" == "None" || -z "$INSTANCE_ID" ]]; then
+            INSTANCE_ID=""
+          fi
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Start instance if stopped
+        if: steps.ec2.outputs.instance_id != ''
+        run: |
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)
+
+          if [ "$STATE" = "stopped" ]; then
+            aws ec2 start-instances --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+            aws ec2 wait instance-running --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+          fi
+
+      # FIX 7: grava userdata.sh em /tmp antes de criar a instância
+      - name: Write userdata.sh
+        if: steps.ec2.outputs.instance_id == ''
+        run: |
+          cat > /tmp/userdata.sh << 'USERDATA'
+          #!/bin/bash
+          set -e
+          if ! command -v docker &>/dev/null; then
+            if command -v amazon-linux-extras &>/dev/null; then
+              amazon-linux-extras install docker -y
+            elif command -v dnf &>/dev/null; then
+              dnf install -y docker
+            else
+              apt-get update -y && apt-get install -y docker.io
+            fi
+            systemctl enable docker && systemctl start docker
+            usermod -aG docker ec2-user 2>/dev/null || usermod -aG docker ubuntu 2>/dev/null || true
+          fi
+          if ! command -v nginx &>/dev/null; then
+            yum install -y nginx 2>/dev/null || apt-get install -y nginx
+            systemctl enable nginx
+          fi
+          USERDATA
+
+      # FIX 8: --user-data aponta para /tmp/userdata.sh que existe no runner
+      - name: Create EC2 instance
+        if: steps.ec2.outputs.instance_id == ''
+        id: create
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ secrets.AWS_EC2_IMG_ID }}" \
+            --instance-type "${{ secrets.AWS_EC2_INSTANCE_TYPE }}" \
+            --key-name "${{ secrets.AWS_EC2_ACCESS_KEY_NAME }}" \
+            --security-group-ids "${{ secrets.AWS_EC2_SG_ID }}" \
+            --user-data file:///tmp/userdata.sh \
+            --tag-specifications \
+            "ResourceType=instance,Tags=[{Key=Name,Value=${{ secrets.APP_NAME }}-${{ steps.branch.outputs.branch }}},{Key=Branch,Value=${{ steps.branch.outputs.branch }}},{Key=Service,Value=${{ secrets.APP_NAME }}},{Key=ExpiresAt,Value=$(date -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)},{Key=Environment,Value=${{ secrets.APP_ENV }}}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for EC2
+        if: steps.ec2.outputs.instance_id == ''
+        run: aws ec2 wait instance-running --instance-ids "${{ steps.create.outputs.instance_id }}"
+
+      - name: Get public IP
+        id: ip
+        run: |
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          if [ -z "$INSTANCE_ID" ]; then
+            INSTANCE_ID="${{ steps.create.outputs.instance_id }}"
+          fi
+
+          DNS=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicDnsName' \
+            --output text)
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "dns=$DNS" >> $GITHUB_OUTPUT
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Sync HOSTNAME to org secret
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ORGANIZATION: ${{ secrets.ORGANIZATION }}
+          CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
+          DNS: http://${{ steps.ip.outputs.dns }}
+        run: |
+          gh secret set WEB_PUBLIC_DNS \
+            --visibility all \
+            --org $ORGANIZATION \
+            --body "$DNS"
+
+          if [[ ! "$CORS_ALLOWED_ORIGINS" =~ "$DNS" ]]; then
+      
+            NEW_CORS="$DNS,$CORS_ALLOWED_ORIGINS"
+            if [ -z "$CORS_ALLOWED_ORIGINS" ]; then
+              NEW_CORS="$DNS"
+            fi
+
+            gh secret set CORS_ALLOWED_ORIGINS \
+              --visibility all \
+              --org $ORGANIZATION \
+              --body "$NEW_CORS"
+          fi
+
+      - name: Copy image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.ip.outputs.ip }}
+          username: ${{ secrets.AWS_SSH_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
+          source: ${{ steps.docker.outputs.file_name }}
+          target: "/home/${{ secrets.AWS_SSH_USER }}/app/"
+
+      - name: Configure and start service
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ steps.ip.outputs.ip }}
+          username: ${{ secrets.AWS_SSH_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
+          script: |
+            # Docker: instala se ausente (instâncias existentes que não passaram pelo userdata)
+            if ! command -v docker &>/dev/null; then
+              if command -v amazon-linux-extras &>/dev/null; then
+                sudo amazon-linux-extras install docker -y
+              elif command -v dnf &>/dev/null; then
+                sudo dnf install -y docker
+              else
+                sudo apt-get update -y && sudo apt-get install -y docker.io
+              fi
+              sudo systemctl enable docker && sudo systemctl start docker
+              sudo usermod -aG docker "$USER" || true
+            fi
+
+            APP_DIR="/home/${{ secrets.AWS_SSH_USER }}/app"
+            DOCKER_FILE="$APP_DIR/${{ steps.docker.outputs.file_name }}"
+
+            docker load -i "$DOCKER_FILE"
+            docker stop "${{ steps.docker.outputs.image_name }}" 2>/dev/null || true
+            docker rm   "${{ steps.docker.outputs.image_name }}" 2>/dev/null || true
+            docker run -d \
+              --name "${{ steps.docker.outputs.image_name }}" \
+              --restart unless-stopped \
+              -p ${{ secrets.APP_LOCAL_PORT }}:${{ secrets.APP_LOCAL_PORT }} \
+              -e APP_PORT=${{ secrets.APP_LOCAL_PORT }} \
+              "${{ steps.docker.outputs.tag_name }}"
+            docker image prune -f
+
+            # Nginx: instala se ausente
+            if ! command -v nginx &>/dev/null; then
+              sudo yum install -y nginx 2>/dev/null || sudo apt-get install -y nginx
+            fi
+
+            sudo mkdir -p /etc/nginx/conf.d/
+            NGINX_CONFIG="/etc/nginx/conf.d/${{ secrets.APP_NAME }}.conf"
+
+            {
+              echo "server {"
+              echo "    listen 80;"
+              echo "    server_name ${{ steps.ip.outputs.dns }};"
+              echo "    location / {"
+              echo "        proxy_pass http://localhost:${{ secrets.APP_LOCAL_PORT }};"
+              echo "        proxy_http_version 1.1;"
+              echo "        proxy_set_header Host \$host;"
+              echo "        proxy_set_header X-Real-IP \$remote_addr;"
+              echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+              echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+              echo "    }"
+              echo "}"
+            } | sudo tee "$NGINX_CONFIG" > /dev/null
+
+            sudo grep -q 'server_names_hash_bucket_size' /etc/nginx/nginx.conf \
+              && echo "já configurado" \
+              || sudo sed -i '/http {/a\\tserver_names_hash_bucket_size 128;' /etc/nginx/nginx.conf
+
+            sudo rm -f /etc/nginx/sites-enabled/default
+
+            sudo nginx -t
+            sudo systemctl enable nginx
+            sudo systemctl restart nginx
